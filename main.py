@@ -32,7 +32,6 @@ def get_sheets_client():
 
 def add_drop_to_sheet(ticker, date, amount, low_p, high_p):
     sheet = get_sheets_client()
-    # Расчет профита для записи в таблицу
     try:
         p_low = float(amount) * float(low_p)
         p_high = float(amount) * float(high_p)
@@ -50,10 +49,49 @@ def get_all_drops():
         print(f"Ошибка чтения таблицы: {e}")
         return []
 
-# --- BINANCE API ---
+# --- АВТОМАТИЧЕСКИЙ ПОИСК ЦЕН (BINANCE SPOT + WEB3 DEX) ---
+def get_dex_kline_data(contract_address: str, timestamp_ms: int):
+    """Ищет цену смарт-контракта на DEX через GeckoTerminal"""
+    try:
+        # 1. Ищем пул ликвидности по адресу контракта
+        search_url = f"https://api.geckoterminal.com/api/v2/search/pools?query={contract_address}"
+        search_resp = requests.get(search_url).json()
+        
+        if not search_resp.get("data"):
+            return {"error": "Пул ликвидности не найден на DEX"}
+            
+        pool_id = search_resp["data"][0]["id"] 
+        network, pool_address = pool_id.split("_", 1)
+        
+        # 2. Запрашиваем минутную свечу
+        ts_sec = timestamp_ms // 1000
+        ohlcv_url = f"https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool_address}/ohlcv/minute"
+        params = {
+            "aggregate": 1,
+            "before_timestamp": ts_sec + 60, 
+            "limit": 1
+        }
+        
+        ohlcv_resp = requests.get(ohlcv_url, params=params).json()
+        
+        if not ohlcv_resp.get("data") or not ohlcv_resp["data"]["attributes"]["ohlcv_list"]:
+            return {"error": "DEX не хранит поминутную историю за эту дату"}
+            
+        candle = ohlcv_resp["data"]["attributes"]["ohlcv_list"][0]
+        
+        return {
+            "open": float(candle[1]),
+            "high": float(candle[2]),
+            "low": float(candle[3]),
+            "close": float(candle[4])
+        }
+    except Exception as e:
+        return {"error": f"Сбой DEX API: {e}"}
+
 def get_kline_data(symbol: str, timestamp_ms: int):
+    """Определяет, куда идти: на Binance или на DEX"""
     if symbol.startswith("0x"):
-        return {"error": "Web3 контракт"}
+        return get_dex_kline_data(symbol, timestamp_ms)
         
     url = "https://api.binance.com/api/v3/klines"
     params = {
@@ -68,13 +106,13 @@ def get_kline_data(symbol: str, timestamp_ms: int):
         if isinstance(data, dict) and "code" in data:
             return {"error": f"Binance: {data.get('msg')}"}
         if not data: 
-            return {"error": "Свеча не найдена"}
+            return {"error": "Свеча не найдена на Binance"}
         return {
             "open": float(data[0][1]), "high": float(data[0][2]), 
             "low": float(data[0][3]), "close": float(data[0][4])
         }
     except:
-        return {"error": "Ошибка API"}
+        return {"error": "Ошибка API Binance"}
 
 def parse_kyiv_time(date_str: str) -> int:
     dt_obj = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
@@ -114,7 +152,7 @@ def get_drops_menu():
 # --- ХЕНДЛЕРЫ ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
-    await message.answer("Бот Binance Alpha обновлен. Все данные пишутся в Google Sheets.", reply_markup=main_kb)
+    await message.answer("Бот Binance Alpha/Web3 готов. Все данные пишутся в Google Sheets.", reply_markup=main_kb)
 
 @dp.message(F.text == "➕ Добавить раздачу")
 async def start_add(message: types.Message, state: FSMContext):
@@ -140,34 +178,38 @@ async def add_amount(message: types.Message, state: FSMContext):
     await state.update_data(amount=amount_str)
     data = await state.get_data()
     
-    await message.answer("⏳ Проверяю график...")
+    await message.answer("⏳ Ищу график в блокчейне/на бирже...")
     try:
         ts = parse_kyiv_time(data['date'])
         m = get_kline_data(data['ticker'], ts)
         
         if m and "error" not in m:
             add_drop_to_sheet(data['ticker'], data['date'], amount_str, m['low'], m['high'])
-            await message.answer(f"✅ Добавлено! Цена найдена: ${m['low']:.4f} - ${m['high']:.4f}")
+            await message.answer(f"✅ Добавлено! Бот сам нашел цены:\nLow: <b>${m['low']:.4f}</b> | High: <b>${m['high']:.4f}</b>", parse_mode="HTML")
             await state.clear()
         else:
-            await message.answer(f"⚠️ {m['error'] if m else 'Ошибка'}. Введи Low и High через пробел:")
+            await message.answer(f"⚠️ <b>{m['error'] if m else 'График не найден'}</b>\n\nПожалуйста, введи Low и High вручную через пробел (например: 0.20 0.55):", parse_mode="HTML")
             await state.set_state(AddDrop.waiting_for_manual_price)
-    except:
-        await message.answer("Ошибка в дате. Попробуй заново.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка в дате или запросе: {e}. Попробуй заново.")
         await state.clear()
 
 @dp.message(AddDrop.waiting_for_manual_price)
 async def add_manual(message: types.Message, state: FSMContext):
     p = message.text.replace(",", ".").split()
     if len(p) != 2:
-        await message.answer("Нужно 2 числа!")
+        await message.answer("❌ Нужно ровно 2 числа (Low и High) через пробел!")
         return
     data = await state.get_data()
     ticker = data['ticker']
-    if ticker.startswith("0x"): ticker = f"{ticker[:6]}...{ticker[-4:]}"
+    if ticker.startswith("0x"): 
+        ticker = f"{ticker[:6]}...{ticker[-4:]}"
     
-    add_drop_to_sheet(ticker, data['date'], data['amount'], p[0], p[1])
-    await message.answer(f"✅ Сохранено в таблицу с вашими ценами.")
+    try:
+        add_drop_to_sheet(ticker, data['date'], data['amount'], p[0], p[1])
+        await message.answer(f"✅ Успешно сохранено в таблицу с вашими ценами!")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка записи: {e}")
     await state.clear()
 
 @dp.message(F.text == "🎁 Раздачи")
@@ -179,28 +221,36 @@ async def process_drops(callback: types.CallbackQuery):
     _, f_type, val = callback.data.split("_")
     data = get_all_drops()
     if not data:
-        await callback.message.answer("Таблица пуста.")
+        await callback.message.edit_text("Таблица пуста.")
         return
     
-    data.sort(key=lambda x: datetime.strptime(str(x['Date']), "%d.%m.%Y %H:%M"), reverse=True)
-    filtered = data[:int(val)] if f_type == "count" else [d for d in data if datetime.strptime(str(d['Date']), "%d.%m.%Y %H:%M") >= datetime.now() - timedelta(days=int(val))]
+    try:
+        data.sort(key=lambda x: datetime.strptime(str(x['Date']), "%d.%m.%Y %H:%M"), reverse=True)
+        filtered = data[:int(val)] if f_type == "count" else [d for d in data if datetime.strptime(str(d['Date']), "%d.%m.%Y %H:%M") >= datetime.now() - timedelta(days=int(val))]
 
-    res = "📊 <b>Отчет по раздачам:</b>\n\n"
-    for d in filtered:
-        res += (f"🪙 <b>{d['Ticker']}</b> ({d['Date']})\n"
-                f"Насыпали: {d['Amount']} шт.\n"
-                f"Профит: <b>{d.get('Profit Range', 'Нет данных')}</b>\n"
-                f"------------------\n")
-    await callback.message.edit_text(res, parse_mode="HTML")
+        if not filtered:
+            await callback.message.edit_text("За этот период ничего нет.")
+            return
+
+        res = "📊 <b>Отчет Alpha / Launchpool:</b>\n\n"
+        for d in filtered:
+            res += (f"🪙 <b>{d['Ticker']}</b> ({d['Date']})\n"
+                    f"Насыпали: {d['Amount']} шт.\n"
+                    f"Профит: <b>{d.get('Profit Range', 'Нет данных')}</b>\n"
+                    f"------------------\n")
+        await callback.message.edit_text(res, parse_mode="HTML")
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка чтения данных: {e}\nУбедитесь, что в таблице 6 колонок.")
 
 @dp.message(F.text == "🔍 Поиск цены")
 async def search_p(message: types.Message, state: FSMContext):
-    await message.answer("Тикер (BTC):")
+    await message.answer("Тикер или смарт-контракт:")
     await state.set_state(PriceSearch.waiting_for_ticker)
 
 @dp.message(PriceSearch.waiting_for_ticker)
 async def search_t(message: types.Message, state: FSMContext):
-    await state.update_data(t=message.text.upper())
+    t = message.text.strip()
+    await state.update_data(t=t if t.startswith("0x") else t.upper())
     await message.answer("Время Киев (ДД.ММ.ГГГГ ЧЧ:ММ):")
     await state.set_state(PriceSearch.waiting_for_date)
 
@@ -210,14 +260,23 @@ async def search_d(message: types.Message, state: FSMContext):
     try:
         m = get_kline_data(d['t'], parse_kyiv_time(message.text))
         if m and "error" not in m:
-            await message.answer(f"📊 <b>{d['t']}</b>\nLow: ${m['low']}\nHigh: ${m['high']}\nOpen: ${m['open']}\nClose: ${m['close']}", parse_mode="HTML")
+            ticker_display = f"{d['t'][:6]}...{d['t'][-4:]}" if d['t'].startswith("0x") else f"{d['t']}USDT"
+            await message.answer(
+                f"📊 <b>{ticker_display}</b>\n"
+                f"Low: ${m['low']:.4f}\n"
+                f"High: ${m['high']:.4f}\n"
+                f"Open: ${m['open']:.4f}\n"
+                f"Close: ${m['close']:.4f}", 
+                parse_mode="HTML"
+            )
         else:
-            await message.answer(f"Ошибка: {m['error']}")
+            await message.answer(f"❌ Ошибка: {m['error']}")
     except:
-        await message.answer("Ошибка даты.")
+        await message.answer("❌ Ошибка даты.")
     await state.clear()
 
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
