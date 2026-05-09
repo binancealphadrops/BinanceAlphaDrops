@@ -13,12 +13,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- КОНФИГ (Берется из Variables в Railway) ---
+# --- КОНФИГ (Переменные Railway) ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON") 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") 
 
-# Инициализация
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 KYIV_TZ = pytz.timezone("Europe/Kyiv")
@@ -31,20 +30,34 @@ def get_sheets_client():
     client = gspread.authorize(creds)
     return client.open_by_key(SPREADSHEET_ID).sheet1
 
-def add_drop_to_sheet(ticker, date, amount):
+def add_drop_to_sheet(ticker, date, amount, low_p, high_p):
     sheet = get_sheets_client()
-    # Записываем как строку, чтобы Google не ломал формат
-    sheet.append_row([str(ticker), str(date), str(amount)])
+    # Расчет профита для записи в таблицу
+    try:
+        p_low = float(amount) * float(low_p)
+        p_high = float(amount) * float(high_p)
+        profit_str = f"{p_low:.2f}-{p_high:.2f} USDT"
+    except:
+        profit_str = "Ошибка расчета"
+        
+    sheet.append_row([str(ticker), str(date), str(amount), str(low_p), str(high_p), profit_str])
 
 def get_all_drops():
-    sheet = get_sheets_client()
-    return sheet.get_all_records()
+    try:
+        sheet = get_sheets_client()
+        return sheet.get_all_records()
+    except Exception as e:
+        print(f"Ошибка чтения таблицы: {e}")
+        return []
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (BINANCE API) ---
+# --- BINANCE API ---
 def get_kline_data(symbol: str, timestamp_ms: int):
+    if symbol.startswith("0x"):
+        return {"error": "Web3 контракт"}
+        
     url = "https://api.binance.com/api/v3/klines"
     params = {
-        "symbol": f"{symbol.upper()}USDT",
+        "symbol": f"{symbol.strip().upper()}USDT",
         "interval": "1m",
         "startTime": timestamp_ms,
         "limit": 1
@@ -52,30 +65,23 @@ def get_kline_data(symbol: str, timestamp_ms: int):
     try:
         response = requests.get(url, params=params)
         data = response.json()
-        
-        # Если Binance возвращает ошибку (например, неверный тикер)
         if isinstance(data, dict) and "code" in data:
             return {"error": f"Binance: {data.get('msg')}"}
-            
-        # Если данных нет (свеча еще не появилась)
-        if not data or len(data) == 0: 
-            return {"error": "Нет торгов в эту минуту (свеча не найдена)"}
-            
+        if not data: 
+            return {"error": "Свеча не найдена"}
         return {
-            "open": float(data[0][1]), 
-            "high": float(data[0][2]), 
-            "low": float(data[0][3]),
-            "close": float(data[0][4])
+            "open": float(data[0][1]), "high": float(data[0][2]), 
+            "low": float(data[0][3]), "close": float(data[0][4])
         }
-    except Exception as e:
-        return {"error": f"Сбой запроса: {e}"}
+    except:
+        return {"error": "Ошибка API"}
 
 def parse_kyiv_time(date_str: str) -> int:
     dt_obj = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
     kyiv_dt = KYIV_TZ.localize(dt_obj)
     return int(kyiv_dt.timestamp() * 1000)
 
-# --- СОСТОЯНИЯ (FSM) ---
+# --- СОСТОЯНИЯ ---
 class PriceSearch(StatesGroup):
     waiting_for_ticker = State()
     waiting_for_date = State()
@@ -84,8 +90,9 @@ class AddDrop(StatesGroup):
     waiting_for_ticker = State()
     waiting_for_date = State()
     waiting_for_amount = State()
+    waiting_for_manual_price = State()
 
-# --- КЛАВИАТУРЫ ---
+# --- МЕНЮ ---
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🎁 Раздачи"), KeyboardButton(text="🔍 Поиск цены")],
@@ -104,136 +111,113 @@ def get_drops_menu():
         ]
     )
 
-# --- ХЭНДЛЕРЫ ---
+# --- ХЕНДЛЕРЫ ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
-    await message.answer("Бот Binance Alpha готов к работе. Данные в Google Sheets.", reply_markup=main_kb)
+    await message.answer("Бот Binance Alpha обновлен. Все данные пишутся в Google Sheets.", reply_markup=main_kb)
 
 @dp.message(F.text == "➕ Добавить раздачу")
 async def start_add(message: types.Message, state: FSMContext):
-    await message.answer("Введите тикер (напр. NOT):")
+    await message.answer("Введите тикер (NOT) или адрес контракта (0x...):")
     await state.set_state(AddDrop.waiting_for_ticker)
 
 @dp.message(AddDrop.waiting_for_ticker)
 async def add_ticker(message: types.Message, state: FSMContext):
-    await state.update_data(ticker=message.text.upper())
-    await message.answer("Введите дату по Киеву (ДД.ММ.ГГГГ ЧЧ:ММ):")
+    ticker = message.text.strip()
+    await state.update_data(ticker=ticker if ticker.startswith("0x") else ticker.upper())
+    await message.answer("Дата раздачи по Киеву (ДД.ММ.ГГГГ ЧЧ:ММ):")
     await state.set_state(AddDrop.waiting_for_date)
 
 @dp.message(AddDrop.waiting_for_date)
 async def add_date(message: types.Message, state: FSMContext):
-    await state.update_data(date=message.text)
-    await message.answer("Сколько токенов насыпали? (можно с точкой или запятой)")
+    await state.update_data(date=message.text.strip())
+    await message.answer("Количество токенов:")
     await state.set_state(AddDrop.waiting_for_amount)
 
 @dp.message(AddDrop.waiting_for_amount)
 async def add_amount(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    # Заменяем запятую на точку, если ввели случайно с запятой
     amount_str = message.text.replace(",", ".")
+    await state.update_data(amount=amount_str)
+    data = await state.get_data()
+    
+    await message.answer("⏳ Проверяю график...")
     try:
-        add_drop_to_sheet(data['ticker'], data['date'], amount_str)
-        await message.answer(f"✅ <b>{data['ticker']}</b> успешно добавлен в таблицу!", parse_mode="HTML")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка записи в таблицу: {e}")
+        ts = parse_kyiv_time(data['date'])
+        m = get_kline_data(data['ticker'], ts)
+        
+        if m and "error" not in m:
+            add_drop_to_sheet(data['ticker'], data['date'], amount_str, m['low'], m['high'])
+            await message.answer(f"✅ Добавлено! Цена найдена: ${m['low']:.4f} - ${m['high']:.4f}")
+            await state.clear()
+        else:
+            await message.answer(f"⚠️ {m['error'] if m else 'Ошибка'}. Введи Low и High через пробел:")
+            await state.set_state(AddDrop.waiting_for_manual_price)
+    except:
+        await message.answer("Ошибка в дате. Попробуй заново.")
+        await state.clear()
+
+@dp.message(AddDrop.waiting_for_manual_price)
+async def add_manual(message: types.Message, state: FSMContext):
+    p = message.text.replace(",", ".").split()
+    if len(p) != 2:
+        await message.answer("Нужно 2 числа!")
+        return
+    data = await state.get_data()
+    ticker = data['ticker']
+    if ticker.startswith("0x"): ticker = f"{ticker[:6]}...{ticker[-4:]}"
+    
+    add_drop_to_sheet(ticker, data['date'], data['amount'], p[0], p[1])
+    await message.answer(f"✅ Сохранено в таблицу с вашими ценами.")
     await state.clear()
 
 @dp.message(F.text == "🎁 Раздачи")
-async def show_menu(message: types.Message):
-    await message.answer("Выберите количество или период:", reply_markup=get_drops_menu())
+async def show_drops(message: types.Message):
+    await message.answer("Что показать?", reply_markup=get_drops_menu())
 
 @dp.callback_query(F.data.startswith("drops_"))
 async def process_drops(callback: types.CallbackQuery):
-    await callback.message.edit_text("⏳ Запрашиваю данные из таблицы и Binance...")
     _, f_type, val = callback.data.split("_")
+    data = get_all_drops()
+    if not data:
+        await callback.message.answer("Таблица пуста.")
+        return
     
-    try:
-        all_drops = get_all_drops()
-        
-        # Защита от пустой таблицы или неправильных заголовков
-        if not all_drops:
-            await callback.message.edit_text("Таблица пуста или бот не видит заголовки (Ticker, Date, Amount).")
-            return
+    data.sort(key=lambda x: datetime.strptime(str(x['Date']), "%d.%m.%Y %H:%M"), reverse=True)
+    filtered = data[:int(val)] if f_type == "count" else [d for d in data if datetime.strptime(str(d['Date']), "%d.%m.%Y %H:%M") >= datetime.now() - timedelta(days=int(val))]
 
-        all_drops.sort(key=lambda x: datetime.strptime(str(x['Date']), "%d.%m.%Y %H:%M"), reverse=True)
-        
-        if f_type == "count":
-            filtered = all_drops[:int(val)]
-        else:
-            limit = datetime.now() - timedelta(days=int(val))
-            filtered = [d for d in all_drops if datetime.strptime(str(d['Date']), "%d.%m.%Y %H:%M") >= limit]
-
-        if not filtered:
-            await callback.message.edit_text("В базе пока нет подходящих раздач за этот период.")
-            return
-
-        res = "📊 <b>Отчет по раздачам:</b>\n\n"
-        for d in filtered:
-            try:
-                ts = parse_kyiv_time(str(d['Date']))
-                m = get_kline_data(str(d['Ticker']), ts)
-                
-                amount_val = float(str(d['Amount']).replace(',', '.'))
-                
-                # Если бинанс вернул данные без ошибки
-                if m and "error" not in m:
-                    res += (f"🪙 <b>{d['Ticker']}</b> ({d['Date']})\n"
-                            f"Раздали: {amount_val} шт.\n"
-                            f"Цена: L <b>${m['low']:.4f}</b> | H <b>${m['high']:.4f}</b>\n"
-                            f"Профит: <b>${amount_val*m['low']:.2f} — ${amount_val*m['high']:.2f}</b>\n"
-                            f"------------------\n")
-                else:
-                    # Если произошла ошибка с Binance, выводим причину
-                    err_msg = m["error"] if m else "Неизвестная ошибка"
-                    res += (f"🪙 <b>{d['Ticker']}</b> ({d['Date']})\n"
-                            f"❌ <i>{err_msg}</i>\n"
-                            f"------------------\n")
-            except Exception as e:
-                res += (f"🪙 <b>{d.get('Ticker', 'Неизвестно')}</b>\n❌ Ошибка данных: {e}\n------------------\n")
-        
-        await callback.message.edit_text(res, parse_mode="HTML")
-    except Exception as e:
-        await callback.message.edit_text(f"Критическая ошибка: {e}")
+    res = "📊 <b>Отчет по раздачам:</b>\n\n"
+    for d in filtered:
+        res += (f"🪙 <b>{d['Ticker']}</b> ({d['Date']})\n"
+                f"Насыпали: {d['Amount']} шт.\n"
+                f"Профит: <b>{d.get('Profit Range', 'Нет данных')}</b>\n"
+                f"------------------\n")
+    await callback.message.edit_text(res, parse_mode="HTML")
 
 @dp.message(F.text == "🔍 Поиск цены")
-async def start_price_search(message: types.Message, state: FSMContext):
-    await message.answer("Введите тикер (напр. BTC, NOT):")
+async def search_p(message: types.Message, state: FSMContext):
+    await message.answer("Тикер (BTC):")
     await state.set_state(PriceSearch.waiting_for_ticker)
 
 @dp.message(PriceSearch.waiting_for_ticker)
-async def process_p_ticker(message: types.Message, state: FSMContext):
-    await state.update_data(ticker=message.text.upper())
-    await message.answer("Введите время по Киеву (ДД.ММ.ГГГГ ЧЧ:ММ):")
+async def search_t(message: types.Message, state: FSMContext):
+    await state.update_data(t=message.text.upper())
+    await message.answer("Время Киев (ДД.ММ.ГГГГ ЧЧ:ММ):")
     await state.set_state(PriceSearch.waiting_for_date)
 
 @dp.message(PriceSearch.waiting_for_date)
-async def process_p_date(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    ticker = user_data['ticker']
-    date_str = message.text
-    
+async def search_d(message: types.Message, state: FSMContext):
+    d = await state.get_data()
     try:
-        ts = parse_kyiv_time(date_str)
-        m = get_kline_data(ticker, ts)
-        
+        m = get_kline_data(d['t'], parse_kyiv_time(message.text))
         if m and "error" not in m:
-            text = (f"🔍 <b>{ticker}USDT</b>\n"
-                    f"🕒 {date_str} (Киев)\n\n"
-                    f"🟢 Открытие: <b>${m['open']:.4f}</b>\n"
-                    f"🔴 Закрытие: <b>${m['close']:.4f}</b>\n"
-                    f"📈 Максимум: <b>${m['high']:.4f}</b>\n"
-                    f"📉 Минимум: <b>${m['low']:.4f}</b>")
-            await message.answer(text, parse_mode="HTML")
+            await message.answer(f"📊 <b>{d['t']}</b>\nLow: ${m['low']}\nHigh: ${m['high']}\nOpen: ${m['open']}\nClose: ${m['close']}", parse_mode="HTML")
         else:
-            err_msg = m["error"] if m else "Неизвестная ошибка"
-            await message.answer(f"❌ <b>Данные не найдены:</b>\n{err_msg}", parse_mode="HTML")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-    
+            await message.answer(f"Ошибка: {m['error']}")
+    except:
+        await message.answer("Ошибка даты.")
     await state.clear()
 
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
